@@ -7,13 +7,27 @@ Exposes the same tool surface as the Google Calendar connector:
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from .caldav_client import ConfigError, get_client
 
-mcp = FastMCP("apple-calendar")
+# DNS-rebinding protection defaults to allowing only localhost, which 421s the
+# request ("Invalid Host header") when deployed behind a proxy (Hugging Face,
+# Render, etc.). It guards browser-based attacks; this connector is reached
+# server-to-server by Claude and is gated by the secret URL path, so we turn it
+# off. Override with MCP_ALLOWED_HOSTS (comma-separated) to re-enable + scope it.
+_allowed_hosts = [h for h in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",") if h]
+_security = (
+    TransportSecuritySettings(allowed_hosts=_allowed_hosts, allowed_origins=["*"])
+    if _allowed_hosts
+    else TransportSecuritySettings(enable_dns_rebinding_protection=False)
+)
+
+mcp = FastMCP("apple-calendar", transport_security=_security)
 
 
 def _client():
