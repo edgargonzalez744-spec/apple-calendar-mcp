@@ -130,6 +130,22 @@ and they never touch yours.
 **Treat your connector URL like a password** — anyone who has it can read/write your
 calendar. The `MCP_URL_SECRET` in the path is what keeps it private.
 
+## Subscribed calendars (holidays, sports, birthdays…)
+
+Apple does **not** expose *subscribed* calendars (any `webcal://` subscription) over
+CalDAV — they live on your devices, so no third-party tool can read them through iCloud.
+To include them, point the connector at the feed's source URL via `EXTRA_ICS_FEEDS`
+(whitespace- or comma-separated; `webcal://` is accepted). They're read-only.
+
+**Find a subscription's URL**
+- **Mac Calendar:** right-click the subscribed calendar in the sidebar → **Get Info** →
+  copy the **Subscription URL**.
+- **iPhone:** Settings → Calendar → Accounts → **Subscribed Calendars** → tap it → copy
+  the **Server** URL.
+
+Then set it as the `EXTRA_ICS_FEEDS` secret (on Hugging Face: Space → Settings → secrets).
+The connector lists each feed as a calendar and merges its events into `list_events`.
+
 ## Notes & limits
 
 - **app-specific password required** — a normal Apple password will fail with a 401.

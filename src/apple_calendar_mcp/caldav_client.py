@@ -13,17 +13,25 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import re
+import urllib.request
 import uuid
 from functools import lru_cache
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
 import caldav
+import recurring_ical_events
 from caldav.lib.error import NotFoundError
 from dateutil import parser as date_parser
 from icalendar import Calendar as ICalendar
 from icalendar import Event as IEvent
 from icalendar import vCalAddress, vText
+
+# Subscription (ICS/webcal) feeds that iCloud does NOT expose over CalDAV. Users
+# paste the feed URLs into EXTRA_ICS_FEEDS (whitespace- or comma-separated) and
+# we read them directly from the source. These are read-only.
+FEED_ID_PREFIX = "feed:"
 
 ICLOUD_CALDAV_URL = "https://caldav.icloud.com/"
 
@@ -104,6 +112,11 @@ class AppleCalendarClient:
 
     def _find_calendar(self, calendar_id: str) -> caldav.Calendar:
         # calendar_id is the calendar URL (what list_calendars returns as `id`).
+        if calendar_id.startswith(FEED_ID_PREFIX):
+            raise ValueError(
+                "This is a read-only subscription calendar; events can be listed "
+                "but not created, changed, or deleted."
+            )
         target = calendar_id.rstrip("/")
         for cal in self._calendars():
             if str(cal.url).rstrip("/") == target:
@@ -145,6 +158,9 @@ class AppleCalendarClient:
                 "supported_components": comps,
                 **props,
             })
+        # Append subscription feeds (holidays, sports, etc.) that iCloud's CalDAV
+        # interface does not expose.
+        out.extend(list_feed_calendars())
         return out
 
     # -- events -----------------------------------------------------------
@@ -153,9 +169,19 @@ class AppleCalendarClient:
                     max_results: int = 100) -> list[dict[str, Any]]:
         start = _parse_dt(time_min) if time_min else dt.datetime.now(_default_tz())
         end = _parse_dt(time_max) if time_max else start + dt.timedelta(days=30)
-        calendars = [self._find_calendar(calendar_id)] if calendar_id else self._calendars()
 
         events: list[dict[str, Any]] = []
+
+        # Subscription feeds (read-only, not in iCloud CalDAV).
+        if calendar_id and calendar_id.startswith(FEED_ID_PREFIX):
+            events.extend(feed_events(calendar_id[len(FEED_ID_PREFIX):], start, end, query))
+            events.sort(key=lambda e: e.get("start") or "")
+            return events[:max_results]
+        if not calendar_id:
+            for url in parse_feed_env():
+                events.extend(feed_events(url, start, end, query))
+
+        calendars = [self._find_calendar(calendar_id)] if calendar_id else self._calendars()
         for cal in calendars:
             try:
                 comps = cal.get_supported_components()
@@ -376,42 +402,119 @@ class AppleCalendarClient:
             ical = caldav_event.icalendar_instance
         except Exception:
             ical = ICalendar.from_ical(caldav_event.data)
-        out: list[dict[str, Any]] = []
-        for comp in ical.walk("VEVENT"):
-            dtstart = comp.get("dtstart")
-            dtend = comp.get("dtend")
-            all_day = _is_all_day(comp)
-            attendees = comp.get("attendee")
-            if attendees is not None and not isinstance(attendees, list):
-                attendees = [attendees]
-            out.append({
-                "id": str(comp.get("uid")),
-                "uid": str(comp.get("uid")),
-                "calendar_id": calendar_id,
-                "summary": str(comp.get("summary")) if comp.get("summary") else None,
-                "description": str(comp.get("description")) if comp.get("description") else None,
-                "location": str(comp.get("location")) if comp.get("location") else None,
-                "start": _iso(dtstart.dt) if dtstart else None,
-                "end": _iso(dtend.dt) if dtend else None,
-                "all_day": all_day,
-                "status": str(comp.get("status")) if comp.get("status") else None,
-                "transparent": str(comp.get("transp", "OPAQUE")).upper() == "TRANSPARENT",
-                "organizer": str(comp.get("organizer")) if comp.get("organizer") else None,
-                "attendees": [
-                    {
-                        "email": str(a).replace("mailto:", ""),
-                        "status": a.params.get("PARTSTAT"),
-                        "name": a.params.get("CN"),
-                    }
-                    for a in (attendees or [])
-                ],
-                "recurrence": str(comp.get("rrule").to_ical().decode()) if comp.get("rrule") else None,
-                "html_link": None,
-            })
-        return out
+        return [_component_to_dict(comp, calendar_id) for comp in ical.walk("VEVENT")]
+
+
+# -- subscription (ICS/webcal) feeds -------------------------------------
+def _normalize_feed_url(url: str) -> str:
+    url = url.strip()
+    if url.lower().startswith("webcal://"):
+        url = "https://" + url[len("webcal://"):]
+    return url
+
+
+def parse_feed_env() -> list[str]:
+    """Read EXTRA_ICS_FEEDS — whitespace/comma-separated feed URLs."""
+    raw = os.environ.get("EXTRA_ICS_FEEDS", "")
+    urls = [u for u in re.split(r"[\s,]+", raw) if u.strip()]
+    return [_normalize_feed_url(u) for u in urls]
+
+
+@lru_cache(maxsize=64)
+def _fetch_feed(url: str, _bucket: int) -> bytes:
+    """Fetch raw ICS bytes. `_bucket` is a coarse time bucket so the cache
+    refreshes periodically without a real clock in the hot path."""
+    req = urllib.request.Request(url, headers={"User-Agent": "apple-calendar-mcp"})
+    with urllib.request.urlopen(req, timeout=20) as resp:  # noqa: S310 (user-provided URL)
+        return resp.read()
+
+
+def _feed_calendar(url: str) -> ICalendar | None:
+    try:
+        bucket = int(dt.datetime.now(dt.timezone.utc).timestamp() // 900)  # 15-min cache
+        return ICalendar.from_ical(_fetch_feed(url, bucket))
+    except Exception:
+        return None
+
+
+def _feed_name(cal: ICalendar, url: str) -> str:
+    name = cal.get("X-WR-CALNAME")
+    if name:
+        return str(name)
+    return url.rstrip("/").rsplit("/", 1)[-1] or url
+
+
+def list_feed_calendars() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for url in parse_feed_env():
+        cal = _feed_calendar(url)
+        name = _feed_name(cal, url) if cal else url
+        out.append({
+            "id": f"{FEED_ID_PREFIX}{url}",
+            "name": name,
+            "color": None,
+            "supported_components": ["VEVENT"],
+            "read_only": True,
+            "subscription": True,
+        })
+    return out
+
+
+def feed_events(url: str, start: dt.datetime, end: dt.datetime,
+                query: str | None = None) -> list[dict[str, Any]]:
+    cal = _feed_calendar(url)
+    if cal is None:
+        return []
+    calendar_id = f"{FEED_ID_PREFIX}{url}"
+    out: list[dict[str, Any]] = []
+    try:
+        occurrences = recurring_ical_events.of(cal).between(start, end)
+    except Exception:
+        occurrences = [c for c in cal.walk("VEVENT")]
+    for comp in occurrences:
+        d = _component_to_dict(comp, calendar_id)
+        d["read_only"] = True
+        if query and query.lower() not in (
+            (d.get("summary") or "") + " " + (d.get("description") or "")
+        ).lower():
+            continue
+        out.append(d)
+    return out
 
 
 # -- module-level iCal helpers -------------------------------------------
+def _component_to_dict(comp: Any, calendar_id: str) -> dict[str, Any]:
+    dtstart = comp.get("dtstart")
+    dtend = comp.get("dtend")
+    attendees = comp.get("attendee")
+    if attendees is not None and not isinstance(attendees, list):
+        attendees = [attendees]
+    return {
+        "id": str(comp.get("uid")),
+        "uid": str(comp.get("uid")),
+        "calendar_id": calendar_id,
+        "summary": str(comp.get("summary")) if comp.get("summary") else None,
+        "description": str(comp.get("description")) if comp.get("description") else None,
+        "location": str(comp.get("location")) if comp.get("location") else None,
+        "start": _iso(dtstart.dt) if dtstart else None,
+        "end": _iso(dtend.dt) if dtend else None,
+        "all_day": _is_all_day(comp),
+        "status": str(comp.get("status")) if comp.get("status") else None,
+        "transparent": str(comp.get("transp", "OPAQUE")).upper() == "TRANSPARENT",
+        "organizer": str(comp.get("organizer")) if comp.get("organizer") else None,
+        "attendees": [
+            {
+                "email": str(a).replace("mailto:", ""),
+                "status": a.params.get("PARTSTAT"),
+                "name": a.params.get("CN"),
+            }
+            for a in (attendees or [])
+        ],
+        "recurrence": str(comp.get("rrule").to_ical().decode()) if comp.get("rrule") else None,
+        "html_link": None,
+    }
+
+
 def _is_all_day(comp: Any) -> bool:
     dtstart = comp.get("dtstart")
     if dtstart is None:
